@@ -3,33 +3,21 @@ from fastapi.responses import Response
 import requests
 import os
 from dotenv import load_dotenv
-import whisper
-from google import genai
 
-from twilio.rest import Client as TwilioClient
-
+from whisper_service import transcribe_audio
+from gemini_service import generate_reply, summarize_conversation
+from whatsapp_service import send_whatsapp
 
 # Load environment variables
 load_dotenv()
 
-# Initialize FastAPI
 app = FastAPI()
 
-# Load Whisper model once
-whisper_model = whisper.load_model("base")
-
-# Setup Gemini client
-client = genai.Client()
-
-# Twilio WhatsApp client
-twilio_client = TwilioClient(
-    os.getenv("TWILIO_ACCOUNT_SID"),
-    os.getenv("TWILIO_AUTH_TOKEN")
-)
-
-# Store conversation in memory
+# Conversation memory
 conversation_log = []
 
+# Safety limit
+MAX_TURNS = 12
 
 
 @app.get("/")
@@ -37,12 +25,12 @@ def home():
     return {"message": "AI assistant running"}
 
 
-# Incoming call handler
+# Incoming call
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def incoming_call():
     response = """
     <Response>
-        <Say>Hello, this is Abhinav's AI assistant.How can I help you?</Say>
+        <Say>Hello, this is Abhinav's AI assistant. How can I help you?</Say>
         <Record action="/process-recording" maxLength="20" />
     </Response>
     """
@@ -52,57 +40,83 @@ async def incoming_call():
 # Process recording
 @app.api_route("/process-recording", methods=["GET", "POST"])
 async def process_recording(request: Request):
-    form_data = await request.form()
-    recording_url = form_data.get("RecordingUrl")
+    try:
+        form_data = await request.form()
+        recording_url = form_data.get("RecordingUrl")
 
-    print("Recording URL:", recording_url)
+        print("Recording URL:", recording_url)
 
-    # Download audio with Twilio authentication
-    audio_file = requests.get(
-        recording_url + ".wav",
-        auth=(
-            os.getenv("TWILIO_ACCOUNT_SID"),
-            os.getenv("TWILIO_AUTH_TOKEN")
+        # Download audio
+        audio_file = requests.get(
+            recording_url + ".wav",
+            auth=(
+                os.getenv("TWILIO_ACCOUNT_SID"),
+                os.getenv("TWILIO_AUTH_TOKEN")
+            )
         )
-    )
 
-    with open("call.wav", "wb") as f:
-        f.write(audio_file.content)
+        with open("call.wav", "wb") as f:
+            f.write(audio_file.content)
 
-    # Transcribe with Whisper
-    result = whisper_model.transcribe("call.wav")
-    caller_text = result["text"]
+        # Transcribe
+        caller_text = transcribe_audio("call.wav")
+        print("Caller said:", caller_text)
 
-    print("Caller said:", caller_text)
+        conversation_log.append(f"Caller: {caller_text}")
 
-    # Generate AI reply using Gemini (new SDK)
-    prompt = f"""
-    You are Abhinav Sachan’s personal phone assistant.
+        # Generate AI reply
+        ai_reply = generate_reply(conversation_log, caller_text)
+        print("AI reply:", ai_reply)
 
-    Rules:
-    - Speak politely and naturally like a human.
-    - Keep responses short (1–2 sentences).
-    - Always ask a follow-up question to continue the conversation.
-    - Try to understand the purpose of the call.
+        conversation_log.append(f"Assistant: {ai_reply}")
 
-    Caller said: {caller_text}
-    """
+        # Detect end phrases
+        end_phrases = [
+            "goodbye",
+            "thank you for calling",
+            "have a nice day",
+            "bye"
+        ]
 
-    response = client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt
-    )
+        should_end = any(phrase in ai_reply.lower() for phrase in end_phrases)
 
-    ai_reply = response.text.strip()
+        if len(conversation_log) >= MAX_TURNS:
+            should_end = True
 
-    print("AI reply:", ai_reply)
+        # End call and summarize
+        if should_end:
+            summary = summarize_conversation(conversation_log)
+            print("Call Summary:", summary)
 
-    # Return voice response
-    twiml = f"""
-<Response>
-    <Say>{ai_reply}</Say>
-    <Record action="/process-recording" maxLength="20" />
-</Response>
-    """
+            send_whatsapp(f"Call Summary:\n{summary}")
 
-    return Response(content=twiml, media_type="application/xml")
+            conversation_log.clear()
+
+            twiml = f"""
+            <Response>
+                <Say>{ai_reply}</Say>
+                <Hangup/>
+            </Response>
+            """
+        else:
+            # Continue conversation
+            twiml = f"""
+            <Response>
+                <Say>{ai_reply}</Say>
+                <Record action="/process-recording" maxLength="20" />
+            </Response>
+            """
+
+        return Response(content=twiml, media_type="application/xml")
+
+    except Exception as e:
+        print("ERROR during call processing:", str(e))
+
+        # Always return valid TwiML
+        error_twiml = """
+        <Response>
+            <Say>Sorry, something went wrong. Please try again later.</Say>
+            <Hangup/>
+        </Response>
+        """
+        return Response(content=error_twiml, media_type="application/xml")
